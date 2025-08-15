@@ -66,7 +66,7 @@ def extract_image_urls(soup: BeautifulSoup, base_url: str):
         # 1) srcset에서 큰 이미지 우선
         best = pick_from_srcset(img, base_url)
         if best:
-            urls.add(최고)
+            urls.add(best)
         # 2) src
         src = img.get("src")
         if src:
