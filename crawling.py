@@ -1,170 +1,219 @@
-import os, time, re
-from io import BytesIO
+import os
+import time
+import threading
+from queue import Queue
+from urllib.parse import urlparse
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
 
 import requests
-from bs4 import BeautifulSoup
-from PIL import Image
+from dotenv import load_dotenv
+from tqdm import tqdm
 
-# ====== 설정 ======
-PAGES = [
-    # 여기에 수집할 페이지들을 넣으세요
-    "https://example.com/page1",
-    # "https://example.com/page2",
-]
-OUT_DIR = Path("images_only")
-SLEEP_SEC = 0.5
-TIMEOUT = 25
-MIN_W, MIN_H = 400, 400       # 최소 해상도(작은 썸네일 거르기)
-SAVE_AS_JPG = True            # True: JPG로 통일 저장, False: 원 확장자 유지 시도
-ALLOW_DOMAINS = []            # 비워두면 제한 없음. 예: ["example.com", "cdn.example.com"]
+# -------------------------
+# 환경변수 로드
+# -------------------------
+load_dotenv()
 
-HEADERS = {
-    "User-Agent": "SimpleImageDownloader/1.0 (+for research; contact: you@example.com)"
-}
-# ==================
+ACCESS_TOKEN = os.getenv("PIN_ACCESS_TOKEN")
+BOARD_ID = os.getenv("PIN_BOARD_ID")
+OUT_DIR = os.getenv("OUT_DIR", "downloads")
+CONCURRENCY = max(1, int(os.getenv("CONCURRENCY", "4")))
+PAGE_SIZE = max(1, min(50, int(os.getenv("PAGE_SIZE", "50"))))
 
-def is_allowed(url: str) -> bool:
-    if not ALLOW_DOMAINS:
-        return True
-    host = urlparse(url).netloc
-    return any(host.endswith(d) for d in ALLOW_DOMAINS)
+if not ACCESS_TOKEN:
+    raise SystemExit("환경변수 PIN_ACCESS_TOKEN 가 필요합니다 (.env 설정).")
+if not BOARD_ID:
+    raise SystemExit("환경변수 PIN_BOARD_ID 가 필요합니다 (.env 설정).")
 
-def get_soup(url: str) -> BeautifulSoup:
-    time.sleep(SLEEP_SEC)
-    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
-    r.raise_for_status()
-    return BeautifulSoup(r.text, "html.parser")
+BASE = "https://api.pinterest.com/v5"
+HEADERS = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
 
-def pick_from_srcset(tag, base_url: str):
-    srcset = tag.get("srcset")
-    if not srcset:
-        return None
-    best = None
-    best_w = -1
-    for part in srcset.split(","):
-        part = part.strip()
-        if " " in part:
-            u, w = part.rsplit(" ", 1)
+# -------------------------
+# 유틸
+# -------------------------
+def sanitize_filename(name: str, max_len: int = 120) -> str:
+    if not name:
+        return "untitled"
+    bad = '<>:"/\\|?*\x00-\x1F'
+    for ch in bad:
+        name = name.replace(ch, "_")
+    name = "_".join(name.split())  # 공백 압축
+    return name[:max_len].strip("_")
+
+def ensure_dir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
+
+def backoff_sleep(retries: int):
+    # 지수 백오프 (429/5xx 대응)
+    time.sleep(min(60, (2 ** retries)))
+
+# -------------------------
+# Pinterest API
+# -------------------------
+def fetch_pins_page(board_id: str, bookmark: str | None, page_size: int = 50):
+    params = {"page_size": str(page_size)}
+    if bookmark:
+        params["bookmark"] = bookmark
+
+    retries = 0
+    while True:
+        r = requests.get(f"{BASE}/boards/{board_id}/pins", headers=HEADERS, params=params, timeout=30)
+        if r.status_code == 200:
+            return r.json()
+        if r.status_code in (429, 500, 502, 503, 504) and retries < 5:
+            retries += 1
+            backoff_sleep(retries)
+            continue
+        raise RuntimeError(f"핀 목록 요청 실패 {r.status_code}: {r.text}")
+
+def pick_best_image(pin: dict) -> dict | None:
+    # v5: pin.media.images.orig/xlarge/large/medium/small ...
+    media = pin.get("media", {})
+    images = media.get("images", {}) if isinstance(media, dict) else {}
+
+    order = ["orig", "xlarge", "large", "medium", "small"]
+    for key in order:
+        img = images.get(key)
+        if isinstance(img, dict) and img.get("url"):
+            return img
+
+    # 예외 구조 대비: pin.images.* 가 있을 수 있음
+    fallback = pin.get("images", {})
+    if isinstance(fallback, dict) and fallback:
+        sizes = sorted(
+            [v for v in fallback.values() if isinstance(v, dict) and v.get("url")],
+            key=lambda x: (x.get("width") or 0),
+            reverse=True,
+        )
+        if sizes:
+            return sizes[0]
+    return None
+
+def stream_download(url: str, filepath: Path):
+    retries = 0
+    while True:
+        with requests.get(url, stream=True, timeout=60) as r:
+            if r.status_code == 200:
+                with open(filepath, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 256):
+                        if chunk:
+                            f.write(chunk)
+                return
+            if r.status_code in (429, 500, 502, 503, 504) and retries < 5:
+                retries += 1
+                backoff_sleep(retries)
+                continue
+            raise RuntimeError(f"다운로드 실패 {r.status_code} {url}")
+
+# -------------------------
+# 작업 큐(멀티스레드)
+# -------------------------
+class Downloader:
+    def __init__(self, out_dir: Path, concurrency: int = 4):
+        self.out_dir = out_dir
+        self.q: Queue[dict] = Queue()
+        self.bar = None
+        self.total = 0
+        self.lock = threading.Lock()
+        self.threads = []
+        self.concurrency = concurrency
+
+    def worker(self):
+        while True:
+            job = self.q.get()
+            if job is None:
+                self.q.task_done()
+                break
+            pin = job["pin"]
             try:
-                size = int(re.sub(r"\D", "", w))
-            except Exception:
-                size = 0
-            if size > best_w:
-                best_w = size
-                best = urljoin(base_url, u.strip())
-        else:
-            # 폭 정보 없는 항목
-            if best is None:
-                best = urljoin(base_url, part)
-    return best
+                img = pick_best_image(pin)
+                if not img or not img.get("url"):
+                    # 이미지 없는 핀은 스킵
+                    self._tick()
+                    self.q.task_done()
+                    continue
 
-def extract_image_urls(soup: BeautifulSoup, base_url: str):
-    urls = set()
-    for img in soup.select("img"):
-        # 1) srcset에서 큰 이미지 우선
-        best = pick_from_srcset(img, base_url)
-        if best:
-            urls.add(best)
-        # 2) src
-        src = img.get("src")
-        if src:
-            urls.add(urljoin(base_url, src))
-        # 3) lazy-load 속성 (사이트에 따라 다를 수 있음)
-        for k in ("data-src", "data-original", "data-lazy", "data-owg-src"):
-            v = img.get(k)
-            if v:
-                urls.add(urljoin(base_url, v))
-    return urls
+                url = img["url"]
+                ext = Path(urlparse(url).path).suffix or ".jpg"
 
-def ensure_rgb(img: Image.Image) -> Image.Image:
-    if img.mode not in ("RGB", "L"):
-        return img.convert("RGB")
-    if img.mode == "L":
-        return img.convert("RGB")
-    return img
+                title = pin.get("title") or pin.get("description") or ""
+                base = sanitize_filename(f'{pin.get("id","")}_{title}')
+                if not base:
+                    base = str(pin.get("id", "pin"))
+                filepath = self.out_dir / f"{base}{ext}"
 
-def filename_from_url(url: str) -> str:
-    name = os.path.basename(urlparse(url).path) or "image"
-    # 확장자 없으면 붙이기
-    if "." not in name:
-        name += ".jpg"
-    # 깨끗한 파일명
-    return re.sub(r"[^a-zA-Z0-9_\-\.]", "_", name)
+                # 파일명 중복 방지
+                idx = 1
+                while filepath.exists():
+                    filepath = self.out_dir / f"{base}_{idx}{ext}"
+                    idx += 1
 
-def download_and_save(img_url: str, out_dir: Path):
-    if not is_allowed(img_url):
-        return False
+                stream_download(url, filepath)
+            except Exception as e:
+                # 실패해도 다음 작업 진행
+                # 필요시 로그 파일에 기록하도록 수정 가능
+                pass
+            finally:
+                self._tick()
+                self.q.task_done()
 
-    time.sleep(SLEEP_SEC)
-    r = requests.get(img_url, headers=HEADERS, timeout=TIMEOUT)
-    r.raise_for_status()
+    def _tick(self):
+        if self.bar:
+            with self.lock:
+                self.bar.update(1)
 
-    # MIME이 이미지인지 대략 점검
-    ct = r.headers.get("Content-Type", "")
-    if "image" not in ct:
-        return False
+    def run(self, pins: list[dict]):
+        self.total = len(pins)
+        ensure_dir(self.out_dir)
+        self.bar = tqdm(total=self.total, unit="img", desc="다운로드")
 
-    # Pillow로 열어서 해상도 체크 & 저장
-    img = Image.open(BytesIO(r.content))
-    img = ensure_rgb(img)
-    w, h = img.size
-    if w < MIN_W or h < MIN_H:
-        return False
+        # 워커 시작
+        for _ in range(self.concurrency):
+            t = threading.Thread(target=self.worker, daemon=True)
+            t.start()
+            self.threads.append(t)
 
-    if SAVE_AS_JPG:
-        # JPG로 통일 저장(용량 관리/일관성)
-        base = filename_from_url(img_url)
-        base = re.sub(r"\.[A-Za-z0-9]+$", "", base)  # 기존 확장자 제거
-        fname = f"{base}.jpg"
-        path = out_dir / fname
-        # 중복 방지를 위해 이미 있으면 (1), (2) 카운팅
-        cnt = 1
-        while path.exists():
-            path = out_dir / f"{base}({cnt}).jpg"
-            cnt += 1
-        img.save(path, "JPEG", quality=90)
-        print(f"[SAVE] {path} ({w}x{h})")
-        return True
-    else:
-        # 원 확장자 유지 시도
-        fname = filename_from_url(img_url)
-        path = out_dir / fname
-        cnt = 1
-        while path.exists():
-            name, ext = os.path.splitext(fname)
-            path = out_dir / f"{name}({cnt}){ext}"
-            cnt += 1
-        # 포맷 추정이 애매하면 JPG로 안전 저장
-        try:
-            img.save(path)
-        except Exception:
-            path = out_dir / (os.path.splitext(path.name)[0] + ".jpg")
-            img.save(path, "JPEG", quality=90)
-        print(f"[SAVE] {path} ({w}x{h})")
-        return True
+        # 큐 적재
+        for pin in pins:
+            self.q.put({"pin": pin})
 
+        # 종료 신호
+        for _ in range(self.concurrency):
+            self.q.put(None)
+
+        self.q.join()
+        for t in self.threads:
+            t.join()
+        self.bar.close()
+
+# -------------------------
+# 실행
+# -------------------------
 def main():
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    total = 0
-    for page in PAGES:
-        try:
-            soup = get_soup(page)
-            urls = extract_image_urls(soup, page)
-            for u in urls:
-                try:
-                    if download_and_save(u, OUT_DIR):
-                        total += 1
-                except Exception as e:
-                    print(f"[IMG ERR] {u} -> {e}")
-        except Exception as e:
-            print(f"[PAGE ERR] {page} -> {e}")
+    out_dir = Path(OUT_DIR)
+    ensure_dir(out_dir)
 
-    if total == 0:
-        print("[INFO] 저장된 이미지가 없습니다.")
-    else:
-        print(f"[DONE] 총 {total}개 저장됨.")
+    pins = []
+    bookmark = None
+    total_pages = 0
+
+    while True:
+        data = fetch_pins_page(BOARD_ID, bookmark, PAGE_SIZE)
+        items = data.get("items", [])
+        pins.extend(items)
+        bookmark = data.get("bookmark")
+        total_pages += 1
+        if not bookmark or not items:
+            break
+
+    if not pins:
+        print("가져올 핀이 없습니다. (보드 ID/권한/토큰/스코프 확인)")
+        return
+
+    print(f"총 {len(pins)}개 핀 수집, {total_pages} 페이지.")
+    dl = Downloader(out_dir=out_dir, concurrency=CONCURRENCY)
+    dl.run(pins)
+    print("✅ 완료!")
 
 if __name__ == "__main__":
     main()
